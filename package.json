@@ -9,6 +9,9 @@
     "preview": "vite preview",
     "start": "vite"
   },
+  "engines": {
+    "node": ">=20.19.0"
+  },
   "dependencies": {
     "lucide-react": "^0.555.0",
     "react": "^18.2.0",
