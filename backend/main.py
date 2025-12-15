@@ -1,4 +1,4 @@
-from flask import Flask, render_template, request, jsonify, make_response
+from flask import Flask, render_template, request, jsonify, make_response, send_file
 import re
 from db import create_tables
 import datetime
@@ -6,6 +6,9 @@ import os
 import jwt
 import bcrypt
 import pymysql
+import io
+import pyotp
+import qrcode
 
 app = Flask(__name__)
 conn = create_tables()
@@ -131,6 +134,13 @@ def handle_input(user_input):
             f"- Remaining budget: ${remaining:,.2f}<br><br>"
             "Need help? Type <b>help</b> to see what else I can do.")
 
+def decode_token(token: str):
+    try:
+        return jwt.decode(token, SECRET_KEY, algorithms=[ALGORITHM])
+    except jwt.ExpiredSignatureError:
+        return None
+    except jwt.InvalidTokenError:
+        return None
 
 def create_temp_token(data: dict, expires_minutes=5):
     payload = data.copy()
@@ -144,6 +154,37 @@ def create_temp_token(data: dict, expires_minutes=5):
 
     return jwt.encode(payload, SECRET_KEY, algorithm=ALGORITHM)
 
+def check_temp_token(token: str):
+    if not token:
+        return False, make_response("No token provided.", 400)
+
+    payload = decode_token(token)
+
+    if not payload or payload.get("mfa_pending") is not True:
+        resp = make_response("Unauthorized.", 401)
+        resp.delete_cookie(
+            "temp_token",
+            path="/",
+            httponly=True,
+            secure=False,
+            samesite="Lax"
+        )
+        return False, resp
+
+    if not payload.get("email"):
+        resp = make_response("Invalid token payload.", 401)
+        resp.delete_cookie("temp_token", path="/")
+        return False, resp
+
+    return True, payload
+
+
+def create_access_token(data: dict, expires_minutes: int = 60):
+    payload = data.copy()
+    payload["exp"] = datetime.datetime.utcnow() + datetime.timedelta(minutes=expires_minutes)
+    payload["type"] = "access"
+    return jwt.encode(payload, SECRET_KEY, algorithm=ALGORITHM)
+
 @app.route("/")
 def index():
     return render_template("chat.html")
@@ -153,6 +194,133 @@ def chat():
     user_message = request.json.get("message", "")
     reply = handle_input(user_message)
     return jsonify({"response": reply})
+
+@app.route("/mfa/setup", methods=["GET"])
+def mfa_setup():
+    temp_token = request.cookies.get("temp_token")
+    success, data = check_temp_token(temp_token)
+
+    if not success:
+        return make_response("Invalid or expired token.", 401)
+
+    email = data.get("email")
+    if not email:
+        return make_response("Invalid token payload.", 401)
+
+    try:
+        with conn.cursor() as c:
+            c.execute(
+                "SELECT mfa_secret FROM users WHERE email = %s",
+                (email,)
+            )
+            user = c.fetchone()
+
+            if not user:
+                return make_response("Invalid user.", 401)
+
+            if user.get("mfa_secret"):
+                return make_response("MFA already enabled.", 400)
+
+            secret = pyotp.random_base32()
+            c.execute(
+                "UPDATE users SET mfa_secret = %s WHERE email = %s",
+                (secret, email)
+            )
+        conn.commit()
+
+    except Exception as e:
+        print("DB ERROR:", e)
+        return make_response("Internal server error.", 500)
+
+    totp_uri = pyotp.totp.TOTP(secret).provisioning_uri(
+        name=email,
+        issuer_name="ClutchCall"
+    )
+
+    qr = qrcode.make(totp_uri)
+    buf = io.BytesIO()
+    qr.save(buf, format="PNG")
+    buf.seek(0)
+
+    return send_file(buf, mimetype="image/png")
+
+
+@app.route("/mfa/validate", methods=["POST"])
+def mfa_validate():
+    data = request.get_json()
+    code = data.get("code")
+
+    if not code:
+        return make_response("Missing MFA code.", 400)
+
+    temp_token = request.cookies.get("temp_token")
+    success, token_data = check_temp_token(temp_token)
+
+    if not success:
+        return make_response("Invalid or expired token.", 401)
+
+    email = token_data.get("email")
+    if not email:
+        return make_response("Invalid token payload.", 401)
+
+    with conn.cursor() as c:
+        c.execute(
+            "SELECT email, mfa_secret FROM users WHERE email = %s",
+            (email,)
+        )
+        user = c.fetchone()
+
+    if not user or not user.get("mfa_secret"):
+        return make_response("Unauthorized.", 401)
+
+    totp = pyotp.TOTP(user["mfa_secret"])
+    if not totp.verify(code, valid_window=1):
+        return make_response("Invalid MFA code.", 401)
+
+    access_token = create_access_token({
+        "email": user["email"],
+    })
+
+    resp = make_response('{"status":"ok","mfa":false}', 200)
+    resp.headers["Content-Type"] = "application/json"
+    resp.set_cookie(
+        "token",
+        access_token,
+        path="/",
+        httponly=True,
+        secure=False,  # change later
+        samesite="Lax"
+    )
+    resp.delete_cookie("temp_token")
+
+    return resp
+
+@app.route("/validate", methods=["GET"])
+def validate_token():
+    token = request.cookies.get("token")
+
+    if not token:
+        return make_response("No token provided.", 400)
+
+    payload = decode_token(token)
+
+    if not payload or payload.get("type") != "access":
+        resp = make_response("Unauthorized.", 401)
+        resp.delete_cookie(
+            "token",
+            path="/",
+            httponly=True,
+            secure=False,
+            samesite="Lax"
+        )
+        return resp
+
+    if not payload.get("email"):
+        resp = make_response("Unauthorized.", 401)
+        resp.delete_cookie("token", path="/")
+        return resp
+
+    return make_response("OK", 200)
 
 @app.route("/login", methods=["POST"])
 def login():
@@ -194,7 +362,6 @@ def login():
         )
         return resp
 
-    # MFA set
     temp_token = create_temp_token({
         "email": user["email"],
         "mfa_pending": True
@@ -251,6 +418,20 @@ def register():
 
     resp = make_response('{"status":"ok"}', 200)
     resp.headers["Content-Type"] = "application/json"
+    return resp
+
+@app.route("/logout", methods=["POST"])
+def logout():
+    resp = make_response('{"status":"logged_out"}', 200)
+    resp.headers["Content-Type"] = "application/json"
+    resp.delete_cookie(
+        "token",
+        path="/",
+        httponly=True,
+        secure=False,  # change later
+        samesite="Lax"
+    )
+    resp.delete_cookie("temp_token", path="/")
     return resp
 
 if __name__ == "__main__":

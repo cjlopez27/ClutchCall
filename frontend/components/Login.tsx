@@ -1,8 +1,11 @@
-import { useState } from 'react';
+import { useState, useEffect } from 'react';
 import { Mail, Lock, Eye, EyeOff } from 'lucide-react';
+import { useNavigate } from 'react-router-dom';
 import { Button } from './ui/button';
 import { Input } from './ui/input';
 import { Label } from './ui/label';
+import MFA from "./MFA";
+
 
 interface LoginProps {
   onSignUp?: () => void;
@@ -10,13 +13,33 @@ interface LoginProps {
 }
 
 export function Login({ onSignUp, onForgotPassword }: LoginProps) {
+  const navigate = useNavigate();
+
+
   const [email, setEmail] = useState('');
   const [password, setPassword] = useState('');
   const [showPassword, setShowPassword] = useState(false);
   const [error, setError] = useState("");
   const [showMFA, setShowMFA] = useState(false);
 
+  useEffect(() => {
+    async function checkSession() {
+      try {
+        const res = await fetch("/api/validate", {
+          method: "GET",
+          credentials: "include",
+        });
 
+        if (res.ok) {
+          navigate("/dashboard");
+        }
+      } catch {
+        // don't need to do anything, just let the use log in
+      }
+    }
+
+    checkSession();
+  }, [navigate]);
 
   const handleSubmit = async (e: React.FormEvent) => {
     e.preventDefault();
@@ -41,6 +64,8 @@ export function Login({ onSignUp, onForgotPassword }: LoginProps) {
     setError("Invalid username or password.");
   }
 };
+
+  if (showMFA) return <MFA onComplete={() => window.location.href = "/"} />;
 
   return (
     <div className="min-h-screen bg-slate-950 flex items-center justify-center p-4">
